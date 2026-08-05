@@ -27,6 +27,7 @@ import threading
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
@@ -530,6 +531,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    codex_auth_home: Path | None = None,
 ):
     """
     Initialize the AI Agent.
@@ -622,6 +624,16 @@ def init_agent(
         if isinstance(requested_provider, str) and requested_provider.strip()
         else agent.provider
     )
+    if codex_auth_home is not None:
+        if agent.provider != "openai-codex":
+            raise ValueError("codex_auth_home requires provider=openai-codex")
+        if api_key is not None:
+            raise ValueError("codex_auth_home cannot be combined with an explicit API key")
+        if fallback_model:
+            raise ValueError("codex_auth_home cannot be combined with provider fallback")
+        if credential_pool is not None:
+            raise ValueError("codex_auth_home cannot be combined with a credential pool")
+    agent._codex_auth_static_snapshot = codex_auth_home is not None
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
@@ -1211,8 +1223,14 @@ def init_agent(
         else:
             # No explicit creds — use the centralized provider router
             from agent.auxiliary_client import resolve_provider_client
-            _routed_client, _ = resolve_provider_client(
-                agent.provider or "auto", model=agent.model, raw_codex=True)
+            if codex_auth_home is None:
+                _routed_client, _ = resolve_provider_client(
+                    agent.provider or "auto", model=agent.model, raw_codex=True)
+            else:
+                _routed_client, _ = resolve_provider_client(
+                    agent.provider or "auto", model=agent.model, raw_codex=True,
+                    codex_auth_home=codex_auth_home,
+                )
             if _routed_client is not None:
                 client_kwargs = {
                     "api_key": _routed_client.api_key,
@@ -1382,6 +1400,8 @@ def init_agent(
                 key_used = client_kwargs.get("api_key", "none")
                 if is_token_provider(key_used):
                     print("🔑 Using credentials: Microsoft Entra ID")
+                elif agent._codex_auth_static_snapshot:
+                    print("🔑 Using credentials: read-only Codex OAuth snapshot")
                 elif isinstance(key_used, str) and key_used and key_used != "dummy-key" and len(key_used) > 12:
                     print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
                 else:

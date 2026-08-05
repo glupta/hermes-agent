@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import shlex
@@ -107,6 +108,8 @@ except Exception:  # pragma: no cover - version import should always succeed
     _HERMES_CLI_VERSION = "unknown"
 CODEX_OAUTH_USER_AGENT = f"hermes-cli/{_HERMES_CLI_VERSION}"
 CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
+CODEX_READONLY_AUTH_MAX_BYTES = 64 * 1024
+CODEX_READONLY_AUTH_MIN_TTL_SECONDS = 900
 XAI_OAUTH_ISSUER = "https://auth.x.ai"
 XAI_OAUTH_DISCOVERY_URL = f"{XAI_OAUTH_ISSUER}/.well-known/openid-configuration"
 XAI_OAUTH_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
@@ -3567,6 +3570,147 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     return {
         "tokens": tokens,
         "last_refresh": state.get("last_refresh"),
+    }
+
+
+def resolve_codex_readonly_credentials(
+    codex_auth_home: Path,
+    *,
+    now: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Read one immutable Codex access-token snapshot from an explicit home.
+
+    This deliberately does not reuse the normal runtime resolver: the normal
+    path may lock, import, refresh, probe, persist, or consult a credential
+    pool.  The explicit-home path is construction-only and fail-closed.
+    """
+    auth_home = Path(codex_auth_home)
+    auth_path = auth_home / "auth.json"
+
+    def _fail(failure_class: str) -> None:
+        raise AuthError(
+            f"Codex read-only auth snapshot {auth_path}: {failure_class}",
+            provider="openai-codex",
+            code=f"codex_readonly_{failure_class}",
+            relogin_required=False,
+        )
+
+    required_os_features = ("O_DIRECTORY", "O_NOFOLLOW")
+    if not hasattr(os, "getuid") or any(
+        not hasattr(os, feature) for feature in required_os_features
+    ):
+        _fail("unsupported_platform")
+
+    directory_fd: Optional[int] = None
+    auth_fd: Optional[int] = None
+    close_on_exec = getattr(os, "O_CLOEXEC", 0)
+    try:
+        try:
+            directory_fd = os.open(
+                os.fspath(auth_home),
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | close_on_exec,
+            )
+        except OSError:
+            _fail("directory_open_failed")
+
+        try:
+            directory_stat = os.fstat(directory_fd)
+        except OSError:
+            _fail("directory_stat_failed")
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            _fail("directory_not_directory")
+        if directory_stat.st_uid != os.getuid():
+            _fail("directory_wrong_owner")
+        if stat.S_IMODE(directory_stat.st_mode) & 0o022:
+            _fail("directory_unsafe_permissions")
+
+        try:
+            auth_fd = os.open(
+                "auth.json",
+                os.O_RDONLY
+                | os.O_NOFOLLOW
+                | close_on_exec
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=directory_fd,
+            )
+        except OSError:
+            _fail("file_open_failed")
+
+        try:
+            auth_stat = os.fstat(auth_fd)
+        except OSError:
+            _fail("file_stat_failed")
+        if not stat.S_ISREG(auth_stat.st_mode):
+            _fail("file_not_regular")
+        if auth_stat.st_uid != os.getuid():
+            _fail("file_wrong_owner")
+        if stat.S_IMODE(auth_stat.st_mode) & 0o077:
+            _fail("file_unsafe_permissions")
+        if auth_stat.st_size > CODEX_READONLY_AUTH_MAX_BYTES:
+            _fail("file_oversized")
+
+        try:
+            snapshot = os.read(auth_fd, CODEX_READONLY_AUTH_MAX_BYTES)
+        except OSError:
+            _fail("file_read_failed")
+        if len(snapshot) != auth_stat.st_size:
+            _fail("file_changed_during_read")
+        try:
+            post_read_stat = os.fstat(auth_fd)
+        except OSError:
+            _fail("file_stat_failed")
+        if any(
+            getattr(post_read_stat, field) != getattr(auth_stat, field)
+            for field in (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_uid",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+        ):
+            _fail("file_changed_during_read")
+    finally:
+        if auth_fd is not None:
+            os.close(auth_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+    try:
+        auth_store = json.loads(snapshot.decode("utf-8"))
+        providers = auth_store["providers"]
+        provider_state = providers["openai-codex"]
+        tokens = provider_state["tokens"]
+        access_token = tokens["access_token"]
+    except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        _fail("malformed")
+
+    if not isinstance(access_token, str) or not access_token.strip():
+        _fail("malformed")
+    access_token = access_token.strip()
+    claims = _decode_jwt_claims(access_token)
+    expires_at = claims.get("exp")
+    if (
+        not isinstance(expires_at, (int, float))
+        or isinstance(expires_at, bool)
+        or not math.isfinite(float(expires_at))
+    ):
+        _fail("expiry_unparseable")
+    current_time = time.time() if now is None else float(now)
+    if float(expires_at) <= current_time:
+        _fail("expired")
+    if float(expires_at) <= current_time + CODEX_READONLY_AUTH_MIN_TTL_SECONDS:
+        _fail("insufficient_lifetime")
+
+    return {
+        "provider": "openai-codex",
+        "base_url": DEFAULT_CODEX_BASE_URL,
+        "api_key": access_token,
+        "source": "readonly_auth_snapshot",
+        "last_refresh": None,
+        "auth_mode": "chatgpt",
     }
 
 

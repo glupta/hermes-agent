@@ -5678,6 +5678,7 @@ def resolve_provider_client(
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
     task: Optional[str] = None,
+    codex_auth_home: Path | None = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Central router: given a provider name and optional model, return a
     configured client with the correct auth, base URL, and API format.
@@ -5718,6 +5719,14 @@ def resolve_provider_client(
     original_provider = (provider or "").strip().lower()
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
+
+    if codex_auth_home is not None:
+        if provider != "openai-codex":
+            raise ValueError("codex_auth_home requires provider=openai-codex")
+        if not raw_codex:
+            raise ValueError("codex_auth_home requires the raw Codex client path")
+        if explicit_api_key is not None:
+            raise ValueError("codex_auth_home cannot be combined with an explicit API key")
 
     # MoA virtual provider chokepoint: "moa" is not a real HTTP provider —
     # its acting model is the preset's aggregator slot. The two resolver
@@ -5912,7 +5921,12 @@ def resolve_provider_client(
         if raw_codex:
             # Return the raw OpenAI client for callers that need direct
             # access to responses.stream() (e.g., the main agent loop).
-            codex_token = _read_codex_access_token()
+            if codex_auth_home is not None:
+                from hermes_cli.auth import resolve_codex_readonly_credentials
+
+                codex_token = resolve_codex_readonly_credentials(codex_auth_home)["api_key"]
+            else:
+                codex_token = _read_codex_access_token()
             if not codex_token:
                 logger.warning("resolve_provider_client: openai-codex requested "
                                "but no Codex OAuth token found (run: hermes model)")

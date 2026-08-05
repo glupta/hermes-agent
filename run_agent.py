@@ -507,6 +507,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        codex_auth_home: Path | None = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -591,6 +592,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            codex_auth_home=codex_auth_home,
         )
 
     def _get_session_db_for_recall(self):
@@ -5254,6 +5256,8 @@ class AIAgent:
         return run_codex_create_stream_fallback(self, api_kwargs, client)
 
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
+        if getattr(self, "_codex_auth_static_snapshot", False):
+            return False
         if self.api_mode != "codex_responses" or self.provider not in {"openai-codex", "xai-oauth"}:
             return False
 
