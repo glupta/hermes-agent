@@ -24,6 +24,13 @@ from typing import Dict, List, Optional, Set, Any
 
 logger = logging.getLogger(__name__)
 
+_STUDIO_APPROVE_SH = "/Users/glupta/Dev/studio-hub/lib/approve.sh"
+_STUDIO_APPROVAL_PID_RE = re.compile(r"^\d{9,12}-[0-9a-f]{4}$")
+_STUDIO_APPROVAL_ENV = {
+    "HOME": "/Users/glupta",
+    "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+}
+
 
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
@@ -6321,6 +6328,83 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Studio-held outbound callbacks (sha:verb:proposal-id) ---
+        # Hermes owns the sole long poller for this bot token. This narrow native
+        # bridge is the future plugin extraction point; Send was admitted only
+        # after the end-to-end DROP callback path was separately proven.
+        if data.startswith("sha:"):
+            parts = data.split(":", 2)
+            caller_id = str(getattr(query.from_user, "id", ""))
+            callback_chat_type = str(query_chat_type or "").lower()
+            callback_is_private_self = (
+                callback_chat_type == "private"
+                and str(query_chat_id or "") == caller_id
+            )
+            if (
+                not callback_is_private_self
+                or not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=callback_chat_type,
+                    thread_id=(
+                        str(query_thread_id)
+                        if query_thread_id is not None
+                        else None
+                    ),
+                    user_name=query_user_name,
+                )
+            ):
+                await query.answer(text="⛔ You are not authorized for this action.")
+                return
+            if (
+                len(parts) != 3
+                or parts[1] not in {"drop", "ok"}
+                or not _STUDIO_APPROVAL_PID_RE.fullmatch(parts[2])
+            ):
+                await query.answer(text="This Studio approval action is not enabled.")
+                return
+
+            action = parts[1]
+            await query.answer(text="Dropping…" if action == "drop" else "Sending…")
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    _STUDIO_APPROVE_SH,
+                    "drop" if action == "drop" else "execute",
+                    parts[2],
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    env=_STUDIO_APPROVAL_ENV,
+                )
+                await asyncio.wait_for(process.wait(), timeout=45)
+                dropped = process.returncode == 0
+            except asyncio.TimeoutError:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                dropped = False
+            except Exception:
+                dropped = False
+
+            if action == "drop":
+                status = (
+                    "🗑️ dropped · Studio approval"
+                    if dropped
+                    else "⚠️ Drop failed; nothing sent."
+                )
+            else:
+                status = (
+                    "✅ sent · Studio approval"
+                    if dropped
+                    else "⚠️ Send failed; nothing sent."
+                )
+            try:
+                await query.edit_message_text(text=status, reply_markup=None)
+            except Exception:
+                pass
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):

@@ -1,5 +1,6 @@
 """Tests for Telegram inline keyboard approval buttons."""
 
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -72,6 +73,128 @@ class _AuthRunner:
     def _is_user_authorized(self, source):
         self.last_source = source
         return self.authorized
+
+
+# ===========================================================================
+# Studio-held outbound approval bridge
+# ===========================================================================
+
+class TestStudioHeldApprovalCallback:
+    @staticmethod
+    def _query(data: str, user_id: int = 5025784406):
+        query = AsyncMock()
+        query.data = data
+        query.message = MagicMock()
+        query.message.chat_id = user_id
+        query.message.chat.type = "private"
+        query.message.message_thread_id = None
+        query.from_user = MagicMock()
+        query.from_user.id = user_id
+        query.from_user.first_name = "Akshay"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock()
+        update.callback_query = query
+        return update, query
+
+    @pytest.mark.asyncio
+    async def test_authorized_drop_uses_exact_sanitized_subprocess(self):
+        adapter = _make_adapter()
+        adapter._message_handler = _AuthRunner(authorized=True)._handle_message
+        update, query = self._query("sha:drop:1785299000-abcd")
+        process = MagicMock(returncode=0)
+        process.wait = AsyncMock()
+
+        with patch(
+            "plugins.platforms.telegram.adapter.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ) as spawn:
+            await adapter._handle_callback_query(update, MagicMock())
+
+        spawn.assert_awaited_once_with(
+            "/Users/glupta/Dev/studio-hub/lib/approve.sh",
+            "drop",
+            "1785299000-abcd",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            env={
+                "HOME": "/Users/glupta",
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            },
+        )
+        query.edit_message_text.assert_awaited_once_with(
+            text="🗑️ dropped · Studio approval", reply_markup=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_drop_never_spawns(self):
+        adapter = _make_adapter()
+        adapter._message_handler = _AuthRunner(authorized=False)._handle_message
+        update, query = self._query("sha:drop:1785299000-abcd", user_id=999)
+
+        with patch(
+            "plugins.platforms.telegram.adapter.asyncio.create_subprocess_exec",
+            new=AsyncMock(),
+        ) as spawn:
+            await adapter._handle_callback_query(update, MagicMock())
+
+        spawn.assert_not_awaited()
+        assert "not authorized" in query.answer.call_args.kwargs["text"].lower()
+
+    @pytest.mark.asyncio
+    async def test_authorized_send_uses_execute_and_reports_success(self):
+        adapter = _make_adapter()
+        adapter._message_handler = _AuthRunner(authorized=True)._handle_message
+        update, query = self._query("sha:ok:1785299000-abcd")
+        process = MagicMock(returncode=0)
+        process.wait = AsyncMock()
+
+        with patch(
+            "plugins.platforms.telegram.adapter.asyncio.create_subprocess_exec",
+            new=AsyncMock(return_value=process),
+        ) as spawn:
+            await adapter._handle_callback_query(update, MagicMock())
+
+        assert spawn.await_args.args[:3] == (
+            "/Users/glupta/Dev/studio-hub/lib/approve.sh",
+            "execute",
+            "1785299000-abcd",
+        )
+        query.edit_message_text.assert_awaited_once_with(
+            text="✅ sent · Studio approval", reply_markup=None
+        )
+
+    @pytest.mark.asyncio
+    async def test_group_chat_callback_never_spawns(self):
+        adapter = _make_adapter()
+        adapter._message_handler = _AuthRunner(authorized=True)._handle_message
+        update, query = self._query("sha:ok:1785299000-abcd")
+        query.message.chat.type = "group"
+        query.message.chat_id = -100123
+
+        with patch(
+            "plugins.platforms.telegram.adapter.asyncio.create_subprocess_exec",
+            new=AsyncMock(),
+        ) as spawn:
+            await adapter._handle_callback_query(update, MagicMock())
+
+        spawn.assert_not_awaited()
+        assert "not authorized" in query.answer.call_args.kwargs["text"].lower()
+
+    @pytest.mark.asyncio
+    async def test_malformed_or_unenabled_action_never_spawns(self):
+        adapter = _make_adapter()
+        adapter._message_handler = _AuthRunner(authorized=True)._handle_message
+        for data in ("sha:drop:../../oops", "sha:edit:1785299000-abcd"):
+            update, query = self._query(data)
+            with patch(
+                "plugins.platforms.telegram.adapter.asyncio.create_subprocess_exec",
+                new=AsyncMock(),
+            ) as spawn:
+                await adapter._handle_callback_query(update, MagicMock())
+            spawn.assert_not_awaited()
+            assert "not enabled" in query.answer.call_args.kwargs["text"].lower()
 
 
 # ===========================================================================
