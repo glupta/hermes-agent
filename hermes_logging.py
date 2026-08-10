@@ -569,7 +569,7 @@ _queue_atexit_registered = False
 # flush/reset from another thread (gateway init racing a plugin/CLI path).
 # Without this, two threads can interleave listener.stop()/reassign/start()
 # and leave the queue with two live listeners or an orphaned worker thread.
-_queue_state_lock = threading.Lock()
+_queue_state_lock = threading.RLock()
 
 
 class _NonFormattingQueueHandler(QueueHandler):
@@ -737,26 +737,32 @@ def _add_rotating_handler(
         Optional filter to attach to the handler (e.g. ``_ComponentFilter``
         for gateway.log).
     """
-    resolved = path.resolve()
-    for existing in _queued_file_handlers:
-        if (
-            isinstance(existing, RotatingFileHandler)
-            and Path(getattr(existing, "baseFilename", "")).resolve() == resolved
-        ):
-            return  # already attached
+    # The duplicate check and registration are one transaction.  setup_logging()
+    # may be reached concurrently during gateway startup; checking before taking
+    # this lock let both callers observe no gateway.log handler and register one.
+    # _register_queued_handler() uses the same re-entrant lock for its queue
+    # mutations, so the listener and handler list stay synchronized as well.
+    with _queue_state_lock:
+        resolved = path.resolve()
+        for existing in _queued_file_handlers:
+            if (
+                isinstance(existing, RotatingFileHandler)
+                and Path(getattr(existing, "baseFilename", "")).resolve() == resolved
+            ):
+                return  # already attached
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handler = _ManagedRotatingFileHandler(
-        str(path), maxBytes=max_bytes, backupCount=backup_count,
-        encoding="utf-8",
-    )
-    handler.setLevel(level)
-    handler.setFormatter(formatter)
-    if log_filter is not None:
-        handler.addFilter(log_filter)
-    # Route through the async queue instead of ``logger.addHandler(handler)`` so
-    # the rotation-lock wait never runs on the caller's (often event-loop) thread.
-    _register_queued_handler(handler)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = _ManagedRotatingFileHandler(
+            str(path), maxBytes=max_bytes, backupCount=backup_count,
+            encoding="utf-8",
+        )
+        handler.setLevel(level)
+        handler.setFormatter(formatter)
+        if log_filter is not None:
+            handler.addFilter(log_filter)
+        # Route through the async queue instead of ``logger.addHandler(handler)`` so
+        # the rotation-lock wait never runs on the caller's (often event-loop) thread.
+        _register_queued_handler(handler)
 
 
 def _read_logging_config():

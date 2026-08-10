@@ -677,4 +677,58 @@ class TestAsyncQueueLogging:
             for h in hermes_logging.rotating_file_handlers()
         )
 
+    def test_concurrent_gateway_handler_registration_writes_shutdown_once(
+        self, hermes_home, monkeypatch
+    ):
+        """A concurrent startup must not register gateway.log twice.
+
+        Pause both callers immediately before registration.  Before the
+        duplicate-path check was included in the queue-state lock, each caller
+        could pass that check and both listeners would retain the same sink,
+        duplicating final gateway shutdown-status lines.
+        """
+        register = hermes_logging._register_queued_handler
+        registration_gate = threading.Barrier(2)
+        start_gate = threading.Barrier(2)
+
+        def delayed_register(handler):
+            try:
+                registration_gate.wait(timeout=0.2)
+            except threading.BrokenBarrierError:
+                pass
+            register(handler)
+
+        monkeypatch.setattr(hermes_logging, "_register_queued_handler", delayed_register)
+        target = hermes_home / "logs" / "gateway.log"
+
+        def register_gateway_log():
+            start_gate.wait()
+            hermes_logging._add_rotating_handler(
+                logging.getLogger(),
+                target,
+                level=logging.INFO,
+                max_bytes=1024,
+                backup_count=1,
+                formatter=logging.Formatter("%(message)s"),
+                log_filter=hermes_logging._ComponentFilter(
+                    hermes_logging.COMPONENT_PREFIXES["gateway"]
+                ),
+            )
+
+        workers = [threading.Thread(target=register_gateway_log) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+
+        gateway_handlers = [
+            h for h in hermes_logging.rotating_file_handlers()
+            if Path(getattr(h, "baseFilename", "")).resolve() == target.resolve()
+        ]
+        assert len(gateway_handlers) == 1
+
+        logging.getLogger("gateway.run").info("Gateway stopped (controlled shutdown)")
+        hermes_logging.flush_log_queue()
+        assert target.read_text().count("Gateway stopped (controlled shutdown)") == 1
 
